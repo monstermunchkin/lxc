@@ -33,6 +33,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <stdbool.h>
+#include <ftw.h>
 
 #include <lxc/lxccontainer.h>
 
@@ -49,6 +50,9 @@
 #ifndef HAVE_GETSUBOPT
 #include <../include/getsubopt.h>
 #endif
+
+#define min(a,b) (a) < (b) ? (a) : (b)
+#define max(a,b) (a) > (b) ? (a) : (b)
 
 lxc_log_define(lxc_copy_ui, lxc);
 
@@ -68,8 +72,22 @@ struct mnts {
 	char *lower;
 };
 
+struct map {
+	uid_t srcid;
+	uid_t dstid;
+	unsigned int range;
+};
+
 static unsigned int mnt_table_size = 0;
 static struct mnts *mnt_table = NULL;
+static struct map uidmap = {0};
+static struct map gidmap = {0};
+static int convert_uids = 0;
+static int convert_gids = 0;
+static uid_t range_uid_max = 0;
+static uid_t range_uid_min = ~0;
+static gid_t range_gid_max = 0;
+static gid_t range_gid_min = ~0;
 
 static int my_parser(struct lxc_arguments *args, int c, char *arg);
 
@@ -88,6 +106,8 @@ static const struct option my_longopts[] = {
 	{ "keepname", no_argument, 0, 'K'},
 	{ "keepmac", no_argument, 0, 'M'},
 	{ "tmpfs", no_argument, 0, 't'},
+	{ "uidmap", required_argument, 0, 'u'},
+	{ "gidmap", required_argument, 0, 'g'},
 	LXC_COMMON_OPTIONS
 };
 
@@ -102,8 +122,8 @@ static char *const keys[] = {
 static struct lxc_arguments my_args = {
 	.progname = "lxc-copy",
 	.help = "\n\
---name=NAME [-P lxcpath] -N newname [-p newpath] [-B backingstorage] [-s] [-K] [-M] [-L size [unit]] -- hook options\n\
---name=NAME [-P lxcpath] [-N newname] [-p newpath] [-B backingstorage] -e [-d] [-D] [-K] [-M] [-m {bind,aufs,overlay}=/src:/dest] -- hook options\n\
+--name=NAME [-P lxcpath] -N newname [-p newpath] [-B backingstorage] [-s] [-K] [-M] [-L size [unit]] [-u map] [-g map] -- hook options\n\
+--name=NAME [-P lxcpath] [-N newname] [-p newpath] [-B backingstorage] -e [-d] [-D] [-K] [-M] [-m {bind,aufs,overlay}=/src:/dest] [-u map] [-g map] -- hook options\n\
 --name=NAME [-P lxcpath] -N newname -R\n\
 \n\
 lxc-copy clone a container\n\
@@ -125,6 +145,8 @@ Options :\n\
   -L, --fssize		    size of the new block device for block device containers\n\
   -D, --keedata	            pass together with -e start a persistent snapshot \n\
   -K, --keepname	    keep the hostname of the original container\n\
+  -u, --uidmap=MAP	    map UIDs, where MAP is <srcuid>:<dstuid>:<range>\n\
+  -g, --gidmap=MAP	    map GIDs, where MAP is <srcgid>:<dstgid>:<range>\n\
   --  hook options	    arguments passed to the hook program\n\
   -M, --keepmac		    keep the MAC address of the original container\n",
 	.options = my_longopts,
@@ -164,6 +186,9 @@ static int parse_mntsubopts(char *subopts, char *const *keys,
 static int parse_aufs_mnt(char *mntstring, enum mnttype type);
 static int parse_bind_mnt(char *mntstring, enum mnttype type);
 static int parse_ovl_mnt(char *mntstring, enum mnttype type);
+static int parse_map(char *s, struct map *map);
+int ftw_callback(const char *fpath, const struct stat *st, int typeflag,
+		 struct FTW *ftw);
 
 int main(int argc, char *argv[])
 {
@@ -361,6 +386,7 @@ static int do_clone(struct lxc_container *c, char *newname, char *newpath,
 		    char **args)
 {
 	struct lxc_container *clone;
+	int ret;
 
 	clone = c->clone(c, newname, newpath, flags, bdevtype, NULL, fssize,
 			 args);
@@ -368,6 +394,16 @@ static int do_clone(struct lxc_container *c, char *newname, char *newpath,
 		if (!my_args.quiet)
 			fprintf(stderr, "clone failed\n");
 		return -1;
+	}
+
+	if (convert_uids || convert_gids) {
+		ret = nftw(clone->lxc_conf->rootfs.path, ftw_callback, 1000,
+			   FTW_PHYS|FTW_CHDIR);
+		if (ret < 0) {
+			fprintf(stderr, "Failed to walk path %s %s\n",
+				clone->lxc_conf->rootfs.path, strerror(errno));
+			return -1;
+		}
 	}
 
 	INFO("Created %s as %s of %s\n", newname, task ? "snapshot" : "copy", c->name);
@@ -623,6 +659,16 @@ static int my_parser(struct lxc_arguments *args, int c, char *arg)
 	case 'M':
 		args->keepmac = 1;
 		break;
+	case 'u':
+		convert_uids = 1;
+		if (parse_map(arg, &uidmap) < 0)
+			return -1;
+		break;
+	case 'g':
+		convert_gids = 1;
+		if (parse_map(arg, &gidmap) < 0)
+			return -1;
+		break;
 	}
 
 	return 0;
@@ -874,4 +920,68 @@ err_close:
 err_free:
 	free(premount);
 	return NULL;
+}
+
+static int parse_map(char *s, struct map *map)
+{
+	size_t len;
+	char **maparray = NULL;
+
+	maparray = lxc_string_split(s, ':');
+	if (!maparray) {
+		goto err;
+	}
+
+	len = lxc_array_len((void **)maparray);
+	if (len < 2 || len > 3) {
+		goto err;
+	}
+
+	map->srcid = atoi(maparray[0]);
+	map->dstid = atoi(maparray[1]);
+	map->range = len == 2 ? 65536 : atoi(maparray[2]);
+
+	lxc_free_array((void **)maparray, free);
+	return 0;
+
+err:
+	lxc_free_array((void **)maparray, free);
+	return -1;
+}
+
+// code copied from Serge Hallyn's nsexec/uidmapshift.c
+int ftw_callback(const char *fpath, const struct stat *st,
+		int typeflag, struct FTW *ftw)
+{
+	uid_t new_uid = -1;
+	gid_t new_gid = -1;
+	int ret;
+
+	range_uid_max = max(range_uid_max, st->st_uid);
+	range_uid_min = min(range_uid_min, st->st_uid);
+	range_gid_max = max(range_gid_max, st->st_gid);
+	range_gid_min = min(range_gid_min, st->st_gid);
+
+	if (convert_uids && st->st_uid >= uidmap.srcid && st->st_uid < uidmap.srcid+uidmap.range)
+		new_uid = (st->st_uid-uidmap.srcid) + uidmap.dstid;
+	if (convert_gids && st->st_gid >= gidmap.srcid && st->st_gid < gidmap.srcid+gidmap.range)
+		new_gid = (st->st_gid-gidmap.srcid) + gidmap.dstid;
+	if (new_uid != -1 || new_gid != -1) {
+		ret = lchown(&fpath[ftw->base], new_uid, new_gid);
+		if (ret) {
+			fprintf(stderr, "failed to chown %d:%d %s\n",
+					new_uid, new_gid, fpath);
+			/* well, let's keep going */
+		} else {
+			if (!S_ISLNK(st->st_mode)) {
+				ret = chmod(&fpath[ftw->base], st->st_mode);
+				if (ret) {
+					fprintf(stderr, "failed to reset mode %o on %s\n",
+						st->st_mode, fpath);
+					/* well, let's keep going */
+				}
+			}
+		}
+	}
+	return 0;
 }
