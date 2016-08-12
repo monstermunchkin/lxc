@@ -396,7 +396,7 @@ static int do_clone(struct lxc_container *c, char *newname, char *newpath,
 		return -1;
 	}
 
-	if (convert_uids || convert_gids) {
+	if (!bdev_can_snapshot(clone->lxc_conf) && (convert_uids || convert_gids)) {
 		ret = nftw(clone->lxc_conf->rootfs.path, ftw_callback, 1000,
 			   FTW_PHYS|FTW_CHDIR);
 		if (ret < 0) {

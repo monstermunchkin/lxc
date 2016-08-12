@@ -102,6 +102,7 @@ struct bdev {
 
 bool bdev_is_dir(struct lxc_conf *conf, const char *path);
 bool bdev_can_backup(struct lxc_conf *conf);
+bool bdev_can_snapshot(struct lxc_conf *conf);
 
 /*
  * Instantiate a bdev object.  The src is used to determine which blockdev

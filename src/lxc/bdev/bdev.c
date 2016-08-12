@@ -288,6 +288,18 @@ bool bdev_can_backup(struct lxc_conf *conf)
 	return ret;
 }
 
+bool bdev_can_snapshot(struct lxc_conf *conf)
+{
+	struct bdev *bdev = bdev_init(conf, NULL, NULL, NULL);
+	bool ret;
+
+	if (!bdev)
+		return false;
+	ret = bdev->ops->can_snapshot;
+	bdev_put(bdev);
+	return ret;
+}
+
 /*
  * If we're not snaphotting, then bdev_copy becomes a simple case of mount
  * the original, mount the new, and rsync the contents.
